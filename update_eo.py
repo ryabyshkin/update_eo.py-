@@ -1,462 +1,356 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-update_eo.py — Автоматическое обновление файла ЕО из исходных отчётов 1С.
+EO Report Updater
+Обновляет шаблон EO данными из файлов 1С, сохраняет EO_updated.xlsx.
 
-Источники (папка data/):
-  - vypusk_shi.xlsx       → колонка "Поступление цех, шт"
-  - opt.xlsx              → колонки "Заказ ОПТ, шт" и "Отгружено ОПТ, шт"
-  - ostatok.xlsx          → колонка "Остатки 01.04 шт" (переименована в "Остатки")
-  - prodazhi_nedelya.xlsx → новая колонка продаж шт + "Продажи 02.04.-08.04. руб"
-  - rezerv_lamoda.xlsx    → колонка "Резерв LA 01.04 шт"
-  - rezervy_obsh.xlsx     → колонка "Резерв  01.04 шт"
+Запуск:
+    python3 update_eo.py
 
-Шаблон: EO_template.xlsx  →  Результат: output/EO_updated.xlsx
-
-Ключ связи: "Номенклатура+характеристика"
-Формула ключа: Номенклатура + " (" + Характеристика_до_точкизапятой + ")"
-
-ABC-анализ пересчитывается по каждому листу (дропу) по "Продажи ИТОГО, шт".
+Все файлы должны лежать в одной папке со скриптом.
 """
 
 import re
-import shutil
-import warnings
+import sys
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Font
+import openpyxl
+from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter
 
-warnings.filterwarnings("ignore")
+FOLDER = Path(__file__).parent
 
-# ── Пути ──────────────────────────────────────────────────────────────────────
-DATA_DIR = Path("data")
-TEMPLATE  = DATA_DIR / "EO_template.xlsx"
-OUTPUT    = Path("output") / "EO_updated.xlsx"
+TEMPLATE      = FOLDER / 'EO_template.xlsx'
+OUTPUT        = FOLDER / 'EO_updated.xlsx'
+NEW_SALES_COL = 'Продажи 09.04.-15.04. шт'
 
-# Листы ЕО, которые обновляем
-TARGET_SHEETS = ["SS26", "FW25", "БАЗА", "Предыдущие дропы", "Сопутка и прочее"]
+SHEETS = ['SS26', 'FW25', 'БАЗА', 'Предыдущие дропы', 'Сопутка и прочее']
 
-# Колонка-ключ в ЕО
-KEY_COL = "Номенклатура+характеристика"
+WAREHOUSES = {
+    'В пути в контент отдел Москва Бережковская (В пути)',
+    'В пути в магазин Красноярск (В пути)',
+    'В пути в магазин Москва Авиапарк (В пути)',
+    'В пути в магазин Новосибирск (В пути)',
+    'В пути в магазин С-Петербург (В пути)',
+    'В пути в магазин С. Вражек (В пути)',
+    'В пути в магазин Томск (В пути)',
+    'В пути на ГП Москва (Бережковская)',
+    'Готовая продукция Москва (Бережковская)',
+    'Готовая продукция Томск МАКСПРО',
+    'Контент отдел Москва Бережковская',
+    'Магазин Красноярск',
+    'Магазин Москва Авиапарк',
+    'Магазин Москва С. Вражек',
+    'Магазин Новосибирск',
+    'Магазин С-Петербург',
+    'Магазин Томск',
+}
 
-# Название новой колонки продаж (меняй каждую неделю здесь)
-NEW_SALES_WEEK_LABEL = "Продажи 09.04.-15.04. шт"
+FILL_A = PatternFill(fill_type='solid', fgColor='92D050')
+FILL_B = PatternFill(fill_type='solid', fgColor='FFFF00')
+FILL_C = PatternFill(fill_type='solid', fgColor='FF0000')
 
-# ── Вспомогательные функции ───────────────────────────────────────────────────
+WEEKLY_RE = re.compile(r'^Продажи\s+\d{2}\.\d{2}\.-\d{2}\.\d{2}\.\s*шт$')
 
-def normalize_key(s: str) -> str:
-    """Приводим ключ к нижнему регистру и убираем лишние пробелы."""
-    return str(s).strip().lower() if pd.notna(s) else ""
+def build_key(nom, har):
+    nom = str(nom).strip() if nom is not None else ''
+    har = str(har).strip() if har is not None else ''
+    har = har.split(';')[0].strip()
+    return f'{nom} ({har})'
 
+def to_num(v):
+    if v is None or v == '':
+        return 0.0
+    try:
+        return float(str(v).replace(',', '.').replace('\xa0', '').replace('\u202f', '').replace(' ', ''))
+    except (ValueError, TypeError):
+        return 0.0
 
-def make_key(nom: pd.Series, char: pd.Series) -> pd.Series:
-    """
-    Формирует ключ по формуле: =СЦЕПИТЬ(ном;" ";"(";хар;")")
-    Характеристика обрезается до первого ";".
-    """
-    char_clean = char.astype(str).str.split(";").str[0].str.strip()
-    nom_clean  = nom.astype(str).str.strip()
-    key = nom_clean + " (" + char_clean + ")"
-    return key.str.strip().str.lower()
+def norm(s):
+    return str(s).strip().lower().replace('  ', ' ')
 
+def find_col(ws, header_row, col_name):
+    target = norm(col_name)
+    for ci in range(1, ws.max_column + 1):
+        v = ws.cell(row=header_row, column=ci).value
+        if v is not None and norm(v) == target:
+            return ci
+    return None
 
-def read_1c_file(path: Path, skiprows: int = 4) -> pd.DataFrame:
-    """
-    Читает файл 1С с двойной шапкой (строки 0-3 — заголовок отчёта).
-    skiprows=4 → строка 4 становится заголовком.
-    Колонки дублируются из-за merged cells — берём первое непустое значение.
-    """
-    df = pd.read_excel(path, header=None, skiprows=skiprows)
-    return df
+def get_header_row(ws):
+    target = norm('Номенклатура+характеристика')
+    for ri in range(1, 11):
+        for ci in range(1, ws.max_column + 1):
+            v = ws.cell(row=ri, column=ci).value
+            if v is not None and norm(v) == target:
+                return ri
+    raise ValueError(f'«Номенклатура+характеристика» не найдена на листе «{ws.title}»')
 
+def build_key_index(ws, header_row, key_col):
+    idx = {}
+    for ri in range(header_row + 1, ws.max_row + 1):
+        v = ws.cell(row=ri, column=key_col).value
+        if v:
+            idx[str(v).strip()] = ri
+    return idx
 
-# ── 1. Выпуск ШИ ──────────────────────────────────────────────────────────────
+def fill_column(ws, col_idx, data_map, key_index):
+    filled = 0
+    for key, ri in key_index.items():
+        cell = ws.cell(row=ri, column=col_idx)
+        if key in data_map:
+            cell.value = data_map[key]
+            filled += 1
+        elif str(cell.value).strip() == 'нет данных':
+            cell.value = None
+    return filled
 
-def process_vypusk(path: Path) -> pd.Series:
-    """
-    Возвращает Series: key → сумма количества (поступление цех).
-    """
-    raw = pd.read_excel(path, header=None)
-    # row3 = ["Номенклатура", nan, "Характеристика", nan, "Итого"]
-    # row4 = [nan, nan, nan, nan, "Количество"]
-    # данные с row5
-    df = raw.iloc[5:].copy()
-    df.columns = range(len(df.columns))
-    df = df.rename(columns={0: "ном", 2: "хар", 4: "кол"})
-    df = df[["ном", "хар", "кол"]].dropna(subset=["кол"])
-    df["ном"] = df["ном"].astype(str).str.strip()
-    df["хар"] = df["хар"].astype(str).str.strip()
-    # убираем строки-итоги (номенклатура пустая или nan)
-    df = df[df["ном"].str.lower() != "nan"]
-    df["key"] = make_key(df["ном"], df["хар"])
-    df["кол"] = pd.to_numeric(df["кол"], errors="coerce").fillna(0)
-    return df.groupby("key")["кол"].sum()
+def read_vypusk():
+    print('  vypusk_shi.xlsx ...')
+    ws = openpyxl.load_workbook(FOLDER / 'vypusk_shi.xlsx', data_only=True).active
+    m = {}
+    for row in ws.iter_rows(min_row=5, values_only=True):
+        nom = str(row[0]).strip() if row[0] else ''
+        if not nom or nom == 'None': continue
+        k = build_key(nom, row[2])
+        m[k] = m.get(k, 0) + to_num(row[4])
+    print(f'    → {len(m)} ключей')
+    return m
 
+def read_opt():
+    print('  opt.xlsx ...')
+    ws = openpyxl.load_workbook(FOLDER / 'opt.xlsx', data_only=True).active
+    z, o = {}, {}
+    for row in ws.iter_rows(min_row=5, values_only=True):
+        nom = str(row[0]).strip() if row[0] else ''
+        if not nom or nom == 'None': continue
+        k = build_key(nom, row[2])
+        z[k] = z.get(k, 0) + to_num(row[7])
+        o[k] = o.get(k, 0) + to_num(row[8])
+    print(f'    → {len(z)} ключей')
+    return z, o
 
-# ── 2. ОПТ ────────────────────────────────────────────────────────────────────
+def read_ostatok():
+    print('  ostatok.xlsx ...')
+    ws = openpyxl.load_workbook(FOLDER / 'ostatok.xlsx', data_only=True).active
+    all_rows = list(ws.iter_rows(values_only=True))
+    wh_cols = []
+    for hi in range(min(4, len(all_rows))):
+        for ci, val in enumerate(all_rows[hi]):
+            if val and str(val).strip() in WAREHOUSES and ci not in wh_cols:
+                wh_cols.append(ci)
+    print(f'    складов найдено: {len(wh_cols)}/{len(WAREHOUSES)}')
+    m = {}
+    for row in all_rows[4:]:
+        nom = str(row[3]).strip() if row[3] else ''
+        if not nom or nom == 'None': continue
+        k = build_key(nom, row[5])
+        total = sum(to_num(row[ci]) for ci in wh_cols if ci < len(row))
+        m[k] = m.get(k, 0) + total
+    print(f'    → {len(m)} ключей')
+    return m
 
-def process_opt(path: Path) -> pd.DataFrame:
-    """
-    Возвращает DataFrame с колонками: key, заказано, отгружено.
-    Удаляем ненужные денежные колонки, оставляем Заказано(col7) и Отгружено(col8).
-    """
-    raw = pd.read_excel(path, header=None)
-    df = raw.iloc[6:].copy()       # данные с 7-й строки (0-based row6)
-    df.columns = range(len(df.columns))
-    # col0=Номенклатура, col2=Характеристика, col7=Заказано, col8=Отгружено
-    df = df.rename(columns={0: "ном", 2: "хар", 7: "заказано", 8: "отгружено"})
-    df = df[["ном", "хар", "заказано", "отгружено"]]
-    df["ном"] = df["ном"].astype(str).str.strip()
-    df = df[df["ном"].str.lower() != "nan"]
-    df["key"] = make_key(df["ном"], df["хар"])
-    df["заказано"]  = pd.to_numeric(df["заказано"],  errors="coerce").fillna(0)
-    df["отгружено"] = pd.to_numeric(df["отгружено"], errors="coerce").fillna(0)
-    grp = df.groupby("key")[["заказано", "отгружено"]].sum().reset_index()
-    return grp
+def read_prodazhi():
+    print('  prodazhi_nedelya.xlsx ...')
+    ws = openpyxl.load_workbook(FOLDER / 'prodazhi_nedelya.xlsx', data_only=True).active
+    all_rows = list(ws.iter_rows(values_only=True))
+    shts, rub = {}, {}
+    for row in all_rows[20:]:
+        har = str(row[1]).strip() if row[1] else ''
+        if not har or har == 'None': continue
+        nom = str(row[0]).strip() if row[0] else ''
+        if not nom or nom == 'None': continue
+        k = build_key(nom, har)
+        v21 = to_num(row[21]) if len(row) > 21 else 0
+        v28 = to_num(row[28]) if len(row) > 28 else 0
+        v22 = to_num(row[22]) if len(row) > 22 else 0
+        v29 = to_num(row[29]) if len(row) > 29 else 0
+        shts[k] = shts.get(k, 0) + (v21 - v28)
+        rub[k]  = rub.get(k,  0) + (v22 - v29)
+    print(f'    → {len(shts)} ключей')
+    return shts, rub
 
+def read_rezerv_lamoda():
+    print('  rezerv_lamoda.xlsx ...')
+    ws = openpyxl.load_workbook(FOLDER / 'rezerv_lamoda.xlsx', data_only=True).active
+    all_rows = list(ws.iter_rows(values_only=True))
+    m = {}
+    for row in all_rows[1:]:
+        nom = str(row[0]).strip() if row[0] else ''
+        har = str(row[1]).strip() if row[1] else ''
+        if not har or har == 'None': continue
+        if not nom or nom == 'None': continue
+        if nom.lower().startswith('номенклатура'): continue
+        k = build_key(nom, har)
+        m[k] = m.get(k, 0) + abs(to_num(row[3]))
+    print(f'    → {len(m)} ключей')
+    return m
 
-# ── 3. Остатки ────────────────────────────────────────────────────────────────
+def read_rezerv_obsh():
+    print('  rezervy_obsh.xlsx ...')
+    ws = openpyxl.load_workbook(FOLDER / 'rezervy_obsh.xlsx', data_only=True).active
+    m = {}
+    for row in ws.iter_rows(min_row=5, values_only=True):
+        nom = str(row[0]).strip() if row[0] else ''
+        if not nom or nom == 'None': continue
+        k = build_key(nom, row[2])
+        m[k] = m.get(k, 0) + to_num(row[10])
+    print(f'    → {len(m)} ключей')
+    return m
 
-STOCK_COLS = [
-    "В пути в контент отдел Москва Бережковская (В пути)",
-    "В пути в магазин Красноярск (В пути)",
-    "В пути в магазин Москва Авиапарк (В пути)",
-    "В пути в магазин Новосибирск (В пути)",
-    "В пути в магазин С-Петербург (В пути)",
-    "В пути в магазин С. Вражек (В пути)",
-    "В пути в магазин Томск (В пути)",
-    "В пути на ГП Москва (Бережковская)",
-    "Готовая продукция Москва (Бережковская)",
-    "Готовая продукция Томск МАКСПРО",
-    "Контент отдел Москва Бережковская",
-    "Магазин Красноярск",
-    "Магазин Москва Авиапарк",
-    "Магазин Москва С. Вражек",
-    "Магазин Новосибирск",
-    "Магазин С-Петербург",
-    "Магазин Томск",
-]
+def process_sheet(ws, header_row, key_index,
+                  vypusk, zakazano, otgr, ostatok,
+                  shts, rub, rez_la, rez_obsh, old_itogo):
 
-def process_ostatok(path: Path) -> pd.Series:
-    """
-    row3 = названия складов, row4 = "Свободный остаток".
-    Номенклатура в col3, Характеристика в col5, склады с col6.
-    Возвращает Series: key → итого (сумма по всем складам).
-    """
-    raw = pd.read_excel(path, header=None)
-    # Строим заголовок из двух строк
-    h3 = raw.iloc[3].fillna("").astype(str).str.strip()
-    h4 = raw.iloc[4].fillna("").astype(str).str.strip()
-    # Для складских колонок заголовок = h3 (название склада)
-    headers = []
-    for i, (a, b) in enumerate(zip(h3, h4)):
-        if i in (0, 1, 2, 3, 4, 5):   # служебные
-            headers.append(a if a else f"col{i}")
+    def fc(col_name, data_map):
+        ci = find_col(ws, header_row, col_name)
+        if ci is None:
+            print(f'    [!] не найдена: «{col_name}»')
+            return
+        n = fill_column(ws, ci, data_map, key_index)
+        print(f'    «{col_name}»: {n} ячеек')
+
+    fc('Поступление цех, шт',  vypusk)
+    fc('Заказ ОПТ, шт',         zakazano)
+    fc('Отгружено ОПТ, шт',     otgr)
+    fc('Остатки 01.04 шт',       ostatok)
+
+    itogo_ci = find_col(ws, header_row, 'Продажи ИТОГО, шт')
+    if itogo_ci is None:
+        print('    [!] «Продажи ИТОГО, шт» не найдена — пропускаем вставку')
+    else:
+        ws.insert_cols(itogo_ci)
+        ws.cell(row=header_row, column=itogo_ci).value = NEW_SALES_COL
+        n = fill_column(ws, itogo_ci, shts, key_index)
+        print(f'    «{NEW_SALES_COL}»: {n} ячеек')
+
+        rub_ci = find_col(ws, header_row, 'Продажи 02.04.-08.04. руб')
+        if rub_ci:
+            n = fill_column(ws, rub_ci, rub, key_index)
+            print(f'    «Продажи 02.04.-08.04. руб»: {n} ячеек')
         else:
-            headers.append(a if a else f"col{i}")
-    df = raw.iloc[5:].copy()
-    df.columns = headers[:len(df.columns)] + [f"col{i}" for i in range(len(headers), len(df.columns))]
-    df = df.rename(columns={"Номенклатура": "ном", "Характеристика": "хар"})
-    df["ном"] = df["ном"].astype(str).str.strip()
-    df = df[df["ном"].str.lower() != "nan"]
-    # суммируем склады
-    present_stock_cols = [c for c in STOCK_COLS if c in df.columns]
-    for c in present_stock_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    df["итого"] = df[present_stock_cols].sum(axis=1) if present_stock_cols else 0
-    df["key"] = make_key(df["ном"], df["хар"])
-    return df.groupby("key")["итого"].sum()
+            print('    [!] «Продажи 02.04.-08.04. руб» не найдена')
+
+        new_itogo_ci = find_col(ws, header_row, 'Продажи ИТОГО, шт')
+        if new_itogo_ci:
+            weekly_cols = []
+            for ci in range(1, ws.max_column + 1):
+                v = ws.cell(row=header_row, column=ci).value
+                if v and WEEKLY_RE.match(str(v).strip()):
+                    weekly_cols.append(ci)
+            weekly_cols.sort()
+            if weekly_cols:
+                for ri in key_index.values():
+                    refs = '+'.join(f'{get_column_letter(c)}{ri}' for c in weekly_cols)
+                    ws.cell(row=ri, column=new_itogo_ci).value = f'={refs}'
+                print(f'    «Продажи ИТОГО, шт»: формула ({len(weekly_cols)} нед.)')
+
+    fc('Резерв LA 01.04 шт', rez_la)
+    fc('Резерв  01.04 шт',   rez_obsh)
+
+    abc_ci = find_col(ws, header_row, 'ABC-анализ')
+    if abc_ci is None:
+        print('    [!] «ABC-анализ» не найдена')
+        return
+
+    items = []
+    for key, ri in key_index.items():
+        total = max(0.0, old_itogo.get(key, 0.0) + shts.get(key, 0.0))
+        items.append((ri, total))
+
+    items.sort(key=lambda x: x[1], reverse=True)
+    grand = sum(v for _, v in items)
+    cum = 0.0
+    row_cat = {}
+    for ri, val in items:
+        cum += val
+        pct = cum / grand if grand > 0 else 1.0
+        row_cat[ri] = 'A' if pct <= 0.80 else ('B' if pct <= 0.95 else 'C')
+
+    for key, ri in key_index.items():
+        cat = row_cat.get(ri, 'C')
+        cell = ws.cell(row=ri, column=abc_ci)
+        cell.value = cat
+        cell.fill = FILL_A if cat == 'A' else (FILL_B if cat == 'B' else FILL_C)
+
+    cnt = {c: sum(1 for v in row_cat.values() if v == c) for c in 'ABC'}
+    print(f'    ABC: A={cnt["A"]}, B={cnt["B"]}, C={cnt["C"]}')
 
 
-# ── 4. Продажи за неделю ──────────────────────────────────────────────────────
+def main():
+    print('=' * 55)
+    print('EO Report Updater')
+    print('=' * 55)
 
-def process_prodazhi(path: Path) -> pd.DataFrame:
-    """
-    Формула: продажи_шт = V - AC,  выручка = W - AD.
-    V=col21(Кол. тов. за текущий период), W=col22(Сумма со скидкой за текущий период)
-    AC=col28(Кол. возвратов), AD=col29(Сумма возвратов)
-    Строки с данными начинаются после row20 (строки-итоги/источники заканчиваются).
-    """
-    raw = pd.read_excel(path, header=None)
-    # Берём только строки где col0=Номенклатура, col1=Характеристика
-    # Итоговые строки (Итого, источники) — col1 = NaN и col0 не пустое
-    # Строки с товарами: col1 не пустой
-    df = raw.iloc[1:].copy()   # пропускаем row0 (даты)
-    df.columns = range(len(df.columns))
-    df = df.rename(columns={0: "ном", 1: "хар", 21: "V", 22: "W", 28: "AC", 29: "AD"})
-    # Оставляем только строки с непустой характеристикой (товарные строки)
-    df["хар"] = df["хар"].astype(str).str.strip()
-    df = df[df["хар"].str.lower() != "nan"]
-    df["ном"] = df["ном"].astype(str).str.strip()
-    df = df[df["ном"].str.lower() != "nan"]
-    for c in ["V", "W", "AC", "AD"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    df["продажи_шт"] = df["V"] - df["AC"]
-    df["выручка"]    = df["W"] - df["AD"]
-    df["key"] = make_key(df["ном"], df["хар"])
-    grp = df.groupby("key")[["продажи_шт", "выручка"]].sum().reset_index()
-    return grp
+    required = [
+        'EO_template.xlsx', 'vypusk_shi.xlsx', 'opt.xlsx',
+        'ostatok.xlsx', 'prodazhi_nedelya.xlsx',
+        'rezerv_lamoda.xlsx', 'rezervy_obsh.xlsx',
+    ]
+    missing = [f for f in required if not (FOLDER / f).exists()]
+    if missing:
+        print('❌ Файлы не найдены:')
+        for f in missing: print(f'   • {f}')
+        print(f'\nВсе файлы должны лежать рядом со скриптом:\n{FOLDER}')
+        sys.exit(1)
 
+    print('\n[1/3] Читаем источники...')
+    vypusk         = read_vypusk()
+    zakazano, otgr = read_opt()
+    ostatok        = read_ostatok()
+    shts, rub      = read_prodazhi()
+    rez_la         = read_rezerv_lamoda()
+    rez_obsh       = read_rezerv_obsh()
 
-# ── 5. Резерв Ламода ──────────────────────────────────────────────────────────
+    print('\n  Читаем текущие «Продажи ИТОГО» для ABC...')
+    old_itogo_all = {}
+    wb_ro = openpyxl.load_workbook(TEMPLATE, data_only=True)
+    for sn in SHEETS:
+        if sn not in wb_ro.sheetnames: continue
+        ws_ro = wb_ro[sn]
+        try:
+            hrow = get_header_row(ws_ro)
+            kc   = find_col(ws_ro, hrow, 'Номенклатура+характеристика')
+            ic   = find_col(ws_ro, hrow, 'Продажи ИТОГО, шт')
+            d = {}
+            if kc and ic:
+                for ri in range(hrow + 1, ws_ro.max_row + 1):
+                    k = ws_ro.cell(row=ri, column=kc).value
+                    v = ws_ro.cell(row=ri, column=ic).value
+                    if k: d[str(k).strip()] = to_num(v)
+            old_itogo_all[sn] = d
+            print(f'    {sn}: {len(d)} значений')
+        except Exception as e:
+            print(f'    [!] {sn}: {e}')
+            old_itogo_all[sn] = {}
+    wb_ro.close()
 
-def process_rezerv_lamoda(path: Path) -> pd.Series:
-    """
-    Структура: Место хранения | Характеристика | Количество | Резерв | Свободный остаток
-    Строка 0 = реальный заголовок ["Номенклатура", "Характеристика", ...]
-    Данные с row1. Номенклатура в col0 (Место хранения), col1 = Характеристика.
-    Резерв берём из колонки "Резерв" (col3) — это количество зарезервированного.
-    Знак минус в резерве → берём abs().
-    """
-    df = pd.read_excel(path)
-    # row0 уже стал заголовком при чтении, но pandas взял ["Место хранения","Unnamed:1","Количество","Резерв","Свободный остаток"]
-    # Первая строка данных — row0 = ["Номенклатура","Характеристика",nan,nan,nan] — пропускаем
-    df = df.iloc[1:].copy()
-    df.columns = ["ном", "хар", "кол", "резерв", "своб"]
-    # Строки-итоги (например "КУПИШУЗ ООО") — характеристика NaN
-    df["хар"] = df["хар"].astype(str).str.strip()
-    df = df[df["хар"].str.lower() != "nan"]
-    df["ном"] = df["ном"].astype(str).str.strip()
-    df = df[df["ном"].str.lower() != "nan"]
-    df["резерв"] = pd.to_numeric(df["резерв"], errors="coerce").fillna(0).abs()
-    df["key"] = make_key(df["ном"], df["хар"])
-    return df.groupby("key")["резерв"].sum()
+    print(f'\n[2/3] Обрабатываем шаблон...')
+    wb = openpyxl.load_workbook(TEMPLATE, keep_vba=False)
 
-
-# ── 6. Резервы общие ──────────────────────────────────────────────────────────
-
-def process_rezervy_obsh(path: Path) -> pd.Series:
-    """
-    Та же структура что и ОПТ.
-    col0=Номенклатура, col2=Характеристика, col10=Зарезервировано на складе.
-    """
-    raw = pd.read_excel(path, header=None)
-    df = raw.iloc[6:].copy()
-    df.columns = range(len(df.columns))
-    df = df.rename(columns={0: "ном", 2: "хар", 10: "зарез"})
-    df["ном"] = df["ном"].astype(str).str.strip()
-    df = df[df["ном"].str.lower() != "nan"]
-    df["key"] = make_key(df["ном"], df["хар"])
-    df["зарез"] = pd.to_numeric(df["зарез"], errors="coerce").fillna(0)
-    return df.groupby("key")["зарез"].sum()
-
-
-# ── ABC-анализ ────────────────────────────────────────────────────────────────
-
-def compute_abc(series: pd.Series) -> pd.Series:
-    """
-    Входит Series с продажами (индекс = порядковый по строкам).
-    Возвращает Series с A/B/C.
-    """
-    total = series.sum()
-    if total == 0:
-        return pd.Series([""] * len(series), index=series.index)
-    sorted_idx = series.sort_values(ascending=False).index
-    cumsum = series[sorted_idx].cumsum() / total
-    abc = pd.Series(index=series.index, dtype=str)
-    abc[sorted_idx[cumsum <= 0.8]]                              = "A"
-    abc[sorted_idx[(cumsum > 0.8) & (cumsum <= 0.95)]]         = "B"
-    abc[sorted_idx[cumsum > 0.95]]                              = "C"
-    abc = abc.fillna("")
-    return abc
-
-
-# ── Главная функция обновления ─────────────────────────────────────────────────
-
-def update_eo():
-    print("=== Загрузка исходных данных ===")
-
-    vypusk   = process_vypusk(DATA_DIR / "vypusk_shi.xlsx")
-    print(f"  Выпуск ШИ:       {len(vypusk)} позиций")
-
-    opt_df   = process_opt(DATA_DIR / "opt.xlsx")
-    print(f"  ОПТ:             {len(opt_df)} позиций")
-
-    ostatok  = process_ostatok(DATA_DIR / "ostatok.xlsx")
-    print(f"  Остатки:         {len(ostatok)} позиций")
-
-    prodazhi = process_prodazhi(DATA_DIR / "prodazhi_nedelya.xlsx")
-    print(f"  Продажи (неделя):{len(prodazhi)} позиций")
-
-    rez_la   = process_rezerv_lamoda(DATA_DIR / "rezerv_lamoda.xlsx")
-    print(f"  Резерв Ламода:   {len(rez_la)} позиций")
-
-    rez_obsh = process_rezervy_obsh(DATA_DIR / "rezervy_obsh.xlsx")
-    print(f"  Резервы общие:   {len(rez_obsh)} позиций")
-
-    # Копируем шаблон → output
-    OUTPUT.parent.mkdir(exist_ok=True)
-    shutil.copy(TEMPLATE, OUTPUT)
-
-    print("\n=== Обновление листов ЕО ===")
-    wb = load_workbook(OUTPUT)
-
-    for sheet_name in TARGET_SHEETS:
-        if sheet_name not in wb.sheetnames:
-            print(f"  [ПРОПУСК] Лист '{sheet_name}' не найден")
+    for sn in SHEETS:
+        if sn not in wb.sheetnames:
+            print(f'\n  [!] Лист не найден: {sn}')
             continue
+        print(f'\n  ── {sn} ──')
+        ws = wb[sn]
+        try:
+            hrow      = get_header_row(ws)
+            kc        = find_col(ws, hrow, 'Номенклатура+характеристика')
+            key_index = build_key_index(ws, hrow, kc)
+            print(f'    позиций: {len(key_index)}, заголовки в строке {hrow}')
+            process_sheet(ws, hrow, key_index,
+                          vypusk, zakazano, otgr, ostatok,
+                          shts, rub, rez_la, rez_obsh,
+                          old_itogo_all.get(sn, {}))
+        except Exception as e:
+            print(f'  [!] Ошибка на листе {sn}: {e}')
+            import traceback; traceback.print_exc()
 
-        ws = wb[sheet_name]
-        print(f"\n  Лист: {sheet_name}")
-
-        # Читаем лист через pandas для получения данных
-        df_sheet = pd.read_excel(OUTPUT, sheet_name=sheet_name)
-        if KEY_COL not in df_sheet.columns:
-            print(f"    [ОШИБКА] Колонка '{KEY_COL}' не найдена")
-            continue
-
-        n_rows = len(df_sheet)
-
-        # Находим индексы нужных колонок
-        cols = list(df_sheet.columns)
-
-        def col_idx(name):
-            """0-based индекс колонки → 1-based для openpyxl."""
-            try:
-                return cols.index(name) + 1
-            except ValueError:
-                return None
-
-        # Индексы целевых колонок в Excel (1-based)
-        ci_key          = col_idx(KEY_COL)
-        ci_vypusk       = col_idx("Поступление цех, шт")
-        ci_opt_zak      = col_idx("Заказ ОПТ, шт")
-        ci_opt_otg      = col_idx("Отгружено ОПТ, шт")
-        ci_ostatok      = col_idx("Остатки 01.04 шт")
-        ci_rez_obsh     = col_idx("Резерв  01.04 шт")
-        ci_rez_la       = col_idx("Резерв LA 01.04 шт")
-        ci_prodazhi_rub = col_idx("Продажи 02.04.-08.04. руб")
-
-        # Ищем последнюю существующую колонку продаж шт, чтобы вставить новую после
-        sales_cols = [c for c in cols if re.match(r"Продажи \d{2}\.\d{2}", c) and "шт" in c and "ИТОГО" not in c]
-        itogo_col  = col_idx("Продажи ИТОГО, шт")
-        # Новая колонка продаж — вставляем перед "Продажи ИТОГО, шт" если её нет
-        if NEW_SALES_WEEK_LABEL not in cols and itogo_col:
-            # Вставляем колонку в openpyxl перед ИТОГО
-            ws.insert_cols(itogo_col)
-            ws.cell(row=1, column=itogo_col).value = NEW_SALES_WEEK_LABEL
-            # Сдвигаем все ci после вставки
-            def shift(ci):
-                return ci + 1 if ci and ci >= itogo_col else ci
-            ci_opt_zak      = shift(ci_opt_zak)
-            ci_opt_otg      = shift(ci_opt_otg)
-            ci_ostatok      = shift(ci_ostatok)
-            ci_rez_obsh     = shift(ci_rez_obsh)
-            ci_rez_la       = shift(ci_rez_la)
-            ci_prodazhi_rub = shift(ci_prodazhi_rub)
-            ci_new_sales    = itogo_col      # теперь наша новая колонка
-            itogo_col      += 1
-            print(f"    Добавлена колонка: {NEW_SALES_WEEK_LABEL}")
-        else:
-            ci_new_sales = col_idx(NEW_SALES_WEEK_LABEL) if NEW_SALES_WEEK_LABEL in cols else None
-
-        # Строим lookup-словарь key → row_number (2-based, строка 1 = заголовок)
-        # Перечитываем ws напрямую
-        opt_lookup = opt_df.set_index("key")
-
-        for row_num in range(2, n_rows + 2):   # строки Excel (2..n+1)
-            cell_key = ws.cell(row=row_num, column=ci_key).value
-            if not cell_key:
-                continue
-            key = normalize_key(str(cell_key))
-
-            # ── Выпуск ШИ → Поступление цех, шт
-            if ci_vypusk:
-                val = vypusk.get(key, None)
-                if val is not None:
-                    ws.cell(row=row_num, column=ci_vypusk).value = int(val)
-                elif ws.cell(row=row_num, column=ci_vypusk).value == "нет данных":
-                    ws.cell(row=row_num, column=ci_vypusk).value = None
-
-            # ── ОПТ → Заказ ОПТ, Отгружено ОПТ
-            if key in opt_lookup.index:
-                row_opt = opt_lookup.loc[key]
-                if ci_opt_zak:
-                    v = row_opt["заказано"]
-                    ws.cell(row=row_num, column=ci_opt_zak).value = int(v) if v else None
-                if ci_opt_otg:
-                    v = row_opt["отгружено"]
-                    ws.cell(row=row_num, column=ci_opt_otg).value = int(v) if v else None
-            else:
-                if ci_opt_zak and ws.cell(row=row_num, column=ci_opt_zak).value == "нет данных":
-                    ws.cell(row=row_num, column=ci_opt_zak).value = None
-                if ci_opt_otg and ws.cell(row=row_num, column=ci_opt_otg).value == "нет данных":
-                    ws.cell(row=row_num, column=ci_opt_otg).value = None
-
-            # ── Остатки → Остатки 01.04 шт
-            if ci_ostatok:
-                val = ostatok.get(key, None)
-                ws.cell(row=row_num, column=ci_ostatok).value = int(val) if val is not None else None
-
-            # ── Резерв общий → Резерв  01.04 шт
-            if ci_rez_obsh:
-                val = rez_obsh.get(key, None)
-                ws.cell(row=row_num, column=ci_rez_obsh).value = int(val) if val is not None else None
-
-            # ── Резерв Ламода → Резерв LA 01.04 шт
-            if ci_rez_la:
-                val = rez_la.get(key, None)
-                ws.cell(row=row_num, column=ci_rez_la).value = int(val) if val is not None else None
-
-            # ── Продажи (новая неделя) шт и руб
-            prod_lookup = prodazhi.set_index("key")
-            if key in prod_lookup.index:
-                row_pr = prod_lookup.loc[key]
-                if ci_new_sales:
-                    ws.cell(row=row_num, column=ci_new_sales).value = int(row_pr["продажи_шт"])
-                if ci_prodazhi_rub:
-                    ws.cell(row=row_num, column=ci_prodazhi_rub).value = round(float(row_pr["выручка"]), 2)
-
-        # ── Обновляем формулу Продажи ИТОГО (добавляем новую колонку в SUM)
-        if itogo_col and ci_new_sales:
-            # Находим диапазон всех колонок продаж шт (от первой до новой включительно)
-            from openpyxl.utils import get_column_letter
-            first_sales_ci = None
-            for i, c in enumerate(cols, 1):
-                if re.match(r"Продажи \d{2}\.\d{2}", c) and "шт" in c and "ИТОГО" not in c:
-                    first_sales_ci = i
-                    break
-            if first_sales_ci:
-                col_from = get_column_letter(first_sales_ci)
-                col_to   = get_column_letter(ci_new_sales)
-                for row_num in range(2, n_rows + 2):
-                    ws.cell(row=row_num, column=itogo_col).value = (
-                        f"=SUM({col_from}{row_num}:{col_to}{row_num})"
-                    )
-
-        # ── ABC-анализ
-        ci_abc      = col_idx("ABC-анализ")
-        ci_itogo_sh = col_idx("Продажи ИТОГО, шт")
-        if ci_abc and ci_itogo_sh:
-            sales_values = []
-            for row_num in range(2, n_rows + 2):
-                v = ws.cell(row=row_num, column=ci_itogo_sh).value
-                try:
-                    sales_values.append(float(v) if v is not None else 0.0)
-                except (TypeError, ValueError):
-                    sales_values.append(0.0)
-            sales_series = pd.Series(sales_values)
-            abc_series   = compute_abc(sales_series)
-            fill_a = PatternFill("solid", fgColor="C6EFCE")
-            fill_b = PatternFill("solid", fgColor="FFEB9C")
-            fill_c = PatternFill("solid", fgColor="FFC7CE")
-            for i, row_num in enumerate(range(2, n_rows + 2)):
-                abc_val = abc_series.iloc[i]
-                cell = ws.cell(row=row_num, column=ci_abc)
-                cell.value = abc_val
-                if abc_val == "A":
-                    cell.fill = fill_a
-                elif abc_val == "B":
-                    cell.fill = fill_b
-                elif abc_val == "C":
-                    cell.fill = fill_c
-
-        print(f"    Обновлено: {n_rows} строк")
-
+    print(f'\n[3/3] Сохраняем {OUTPUT.name}...')
     wb.save(OUTPUT)
-    print(f"\n✅ Готово! Файл сохранён: {OUTPUT}")
+    print(f'\n✅ Готово!\n   {OUTPUT}')
 
 
-if __name__ == "__main__":
-    update_eo()
+if __name__ == '__main__':
+    main()
